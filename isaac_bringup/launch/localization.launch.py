@@ -147,6 +147,7 @@ def _build_nodes(context, *args, **kwargs):
             output="screen",
             parameters=[
                 {
+                    "odom_topic": "/rover/estimated_odom",
                     "pixel_stride": 2,
                     "accumulate_window_s": 4.0,
                     "fill_sparse_holes": True,
@@ -223,6 +224,15 @@ def _build_nodes(context, *args, **kwargs):
                 {
                     "sun_yaw_topic": "/rover/sun_yaw",
                     "use_sun_yaw": True,
+                    "front_depth_topic": "/camera/rover/depth",
+                    "wheel_slip_guard_enabled": True,
+                    "front_block_depth_m": 0.75,
+                    "front_block_min_ratio": 0.08,
+                    "front_block_hold_s": 0.60,
+                    "slip_guard_linear_scale": 0.0,
+                    "slip_guard_lateral_scale": 0.0,
+                    "slip_guard_yaw_scale": 0.20,
+                    "slip_guard_noise_multiplier": 25.0,
                     "default_sun_yaw_cov": 0.60,
                     "min_sun_yaw_cov": 0.10,
                     # π 로 풀어 큰 보정도 수용 — EKF wheel-drift 누적이 sun_yaw

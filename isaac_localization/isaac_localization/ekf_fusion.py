@@ -8,10 +8,12 @@ import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion, TransformStamped
+from sensor_msgs.msg import Image
 
 from tf2_ros import TransformBroadcaster
 
@@ -51,6 +53,8 @@ class EKFFusionNode(Node):
         self.declare_parameter("trn_pose_topic", "/rover/trn_pose")
         self.declare_parameter("sun_yaw_topic", "/rover/sun_yaw")
         self.declare_parameter("use_sun_yaw", True)
+        self.declare_parameter("front_depth_topic", "/camera/rover/depth")
+        self.declare_parameter("wheel_slip_guard_enabled", True)
 
         self.declare_parameter("estimated_odom_topic", "/rover/estimated_odom")
         self.declare_parameter("estimated_pose_topic", "/rover/estimated_pose")
@@ -79,6 +83,21 @@ class EKFFusionNode(Node):
         self.declare_parameter("min_sun_yaw_cov", 0.25)
         self.declare_parameter("max_sun_yaw_innovation", 1.20)
 
+        # If the rover is pushing into an obstacle, wheel joints can keep
+        # spinning while the chassis is stationary. A close front-depth return
+        # is used as a realistic stuck/slip cue to suppress forward wheel
+        # integration until the rover backs out or turns away.
+        self.declare_parameter("front_block_depth_m", 0.75)
+        self.declare_parameter("front_block_min_ratio", 0.08)
+        self.declare_parameter("front_block_center_width_ratio", 0.35)
+        self.declare_parameter("front_block_center_height_ratio", 0.45)
+        self.declare_parameter("front_block_hold_s", 0.60)
+        self.declare_parameter("slip_guard_min_forward_delta_m", 0.002)
+        self.declare_parameter("slip_guard_linear_scale", 0.0)
+        self.declare_parameter("slip_guard_lateral_scale", 0.0)
+        self.declare_parameter("slip_guard_yaw_scale", 0.20)
+        self.declare_parameter("slip_guard_noise_multiplier", 25.0)
+
         # output
         self.declare_parameter("publish_tf", False)
 
@@ -90,6 +109,10 @@ class EKFFusionNode(Node):
         self.trn_pose_topic = self.get_parameter("trn_pose_topic").value
         self.sun_yaw_topic = self.get_parameter("sun_yaw_topic").value
         self.use_sun_yaw = bool(self.get_parameter("use_sun_yaw").value)
+        self.front_depth_topic = self.get_parameter("front_depth_topic").value
+        self.wheel_slip_guard_enabled = bool(
+            self.get_parameter("wheel_slip_guard_enabled").value
+        )
 
         self.estimated_odom_topic = self.get_parameter("estimated_odom_topic").value
         self.estimated_pose_topic = self.get_parameter("estimated_pose_topic").value
@@ -146,6 +169,36 @@ class EKFFusionNode(Node):
         )
         self.max_sun_yaw_innovation = float(
             self.get_parameter("max_sun_yaw_innovation").value
+        )
+        self.front_block_depth_m = float(
+            self.get_parameter("front_block_depth_m").value
+        )
+        self.front_block_min_ratio = float(
+            self.get_parameter("front_block_min_ratio").value
+        )
+        self.front_block_center_width_ratio = float(
+            self.get_parameter("front_block_center_width_ratio").value
+        )
+        self.front_block_center_height_ratio = float(
+            self.get_parameter("front_block_center_height_ratio").value
+        )
+        self.front_block_hold_s = float(
+            self.get_parameter("front_block_hold_s").value
+        )
+        self.slip_guard_min_forward_delta_m = float(
+            self.get_parameter("slip_guard_min_forward_delta_m").value
+        )
+        self.slip_guard_linear_scale = float(
+            self.get_parameter("slip_guard_linear_scale").value
+        )
+        self.slip_guard_lateral_scale = float(
+            self.get_parameter("slip_guard_lateral_scale").value
+        )
+        self.slip_guard_yaw_scale = float(
+            self.get_parameter("slip_guard_yaw_scale").value
+        )
+        self.slip_guard_noise_multiplier = float(
+            self.get_parameter("slip_guard_noise_multiplier").value
         )
 
         self.publish_tf_enabled = bool(self.get_parameter("publish_tf").value)
@@ -211,6 +264,12 @@ class EKFFusionNode(Node):
         # twist output용
         self.last_linear_v = 0.0
         self.last_angular_z = 0.0
+        self.wheel_slip_guard_active = False
+        self.front_blocked = False
+        self.front_blocked_until_ns = 0
+        self.front_block_ratio = 0.0
+        self.front_block_min_depth = math.inf
+        self.last_slip_guard_log_ns = 0
 
         self.last_stamp: Optional[Time] = None
 
@@ -247,6 +306,15 @@ class EKFFusionNode(Node):
                 10,
             )
 
+        self.front_depth_sub = None
+        if self.wheel_slip_guard_enabled:
+            self.front_depth_sub = self.create_subscription(
+                Image,
+                self.front_depth_topic,
+                self.front_depth_callback,
+                qos_profile_sensor_data,
+            )
+
         self.estimated_odom_pub = self.create_publisher(
             Odometry,
             self.estimated_odom_topic,
@@ -269,6 +337,11 @@ class EKFFusionNode(Node):
         self.get_logger().info(f"Subscribe trn pose  : {self.trn_pose_topic}")
         if self.use_sun_yaw:
             self.get_logger().info(f"Subscribe sun yaw   : {self.sun_yaw_topic}")
+        if self.wheel_slip_guard_enabled:
+            self.get_logger().info(
+                f"Wheel slip guard : depth={self.front_depth_topic}, "
+                f"block<{self.front_block_depth_m:.2f}m ratio>{self.front_block_min_ratio:.2f}"
+            )
         self.get_logger().info(f"Publish estimated odom: {self.estimated_odom_topic}")
         self.get_logger().info(f"Publish estimated pose: {self.estimated_pose_topic}")
 
@@ -305,11 +378,64 @@ class EKFFusionNode(Node):
             prev_pose=self.prev_wheel_pose,
             current_pose=current_pose,
         )
+        if self.wheel_slip_guard_active and self.last_linear_v > 0.0:
+            self.last_linear_v = 0.0
 
         self.prev_wheel_pose = current_pose
         self.last_stamp = stamp
 
         self.publish_estimate(stamp)
+
+    def front_depth_callback(self, msg: Image) -> None:
+        if not self.wheel_slip_guard_enabled:
+            return
+
+        depth = self.depth_image_to_array(msg)
+        if depth is None or depth.size == 0:
+            return
+
+        height, width = depth.shape
+        wr = min(1.0, max(0.05, self.front_block_center_width_ratio))
+        hr = min(1.0, max(0.05, self.front_block_center_height_ratio))
+
+        x0 = int(width * (0.5 - 0.5 * wr))
+        x1 = int(width * (0.5 + 0.5 * wr))
+        y0 = int(height * (0.5 - 0.5 * hr))
+        y1 = int(height * (0.5 + 0.5 * hr))
+        roi = depth[max(0, y0):min(height, y1), max(0, x0):min(width, x1)]
+        finite = np.isfinite(roi) & (roi > 0.02)
+        if not np.any(finite):
+            self.front_blocked = False
+            return
+
+        finite_depth = roi[finite]
+        close = finite_depth < self.front_block_depth_m
+        ratio = float(np.count_nonzero(close)) / float(finite_depth.size)
+        self.front_block_ratio = ratio
+        self.front_block_min_depth = float(np.nanmin(finite_depth))
+
+        now_ns = self.get_clock().now().nanoseconds
+        blocked = ratio >= self.front_block_min_ratio
+        self.front_blocked = blocked
+        if blocked:
+            self.front_blocked_until_ns = now_ns + int(self.front_block_hold_s * 1.0e9)
+
+    def depth_image_to_array(self, msg: Image) -> Optional[np.ndarray]:
+        encoding = msg.encoding.upper()
+        if encoding == "32FC1":
+            dtype = np.float32
+            scale = 1.0
+        elif encoding == "16UC1":
+            dtype = np.uint16
+            scale = 0.001
+        else:
+            return None
+
+        try:
+            depth = np.frombuffer(msg.data, dtype=dtype).reshape((msg.height, msg.width))
+        except ValueError:
+            return None
+        return depth.astype(np.float32) * scale
 
     def imu_odom_callback(self, msg: Odometry) -> None:
         stamp = self.get_odom_time(msg)
@@ -529,6 +655,24 @@ class EKFFusionNode(Node):
 
         dx_body = c_prev * dx_odom + s_prev * dy_odom
         dy_body = -s_prev * dx_odom + c_prev * dy_odom
+        original_dx_body = dx_body
+        original_dy_body = dy_body
+        original_dyaw = dyaw
+
+        slip_guard_active = self.should_suppress_forward_wheel_delta(dx_body)
+        self.wheel_slip_guard_active = slip_guard_active
+        if slip_guard_active:
+            dx_body *= self.slip_guard_linear_scale
+            dy_body *= self.slip_guard_lateral_scale
+            dyaw *= self.slip_guard_yaw_scale
+            self.maybe_log_slip_guard(
+                original_dx_body=original_dx_body,
+                original_dy_body=original_dy_body,
+                original_dyaw=original_dyaw,
+                dx_body=dx_body,
+                dy_body=dy_body,
+                dyaw=dyaw,
+            )
 
         yaw_est = self.x[self.IDX_YAW, 0]
 
@@ -555,6 +699,10 @@ class EKFFusionNode(Node):
         q_z = self.base_process_noise_z
         q_rp = self.base_process_noise_rp
         q_yaw = self.base_process_noise_yaw + self.process_noise_yaw_per_rad * abs(dyaw)
+        if slip_guard_active:
+            multiplier = max(1.0, self.slip_guard_noise_multiplier)
+            q_xy *= multiplier
+            q_yaw *= multiplier
 
         Q = np.diag([q_xy, q_xy, q_z, q_rp, q_rp, q_yaw]).astype(np.float64)
 
@@ -562,6 +710,37 @@ class EKFFusionNode(Node):
         self.P = self.symmetrize_covariance(self.P)
 
         self.normalize_state_angles()
+
+    def should_suppress_forward_wheel_delta(self, dx_body: float) -> bool:
+        if not self.wheel_slip_guard_enabled:
+            return False
+        if dx_body <= self.slip_guard_min_forward_delta_m:
+            return False
+
+        now_ns = self.get_clock().now().nanoseconds
+        return self.front_blocked or now_ns <= self.front_blocked_until_ns
+
+    def maybe_log_slip_guard(
+        self,
+        original_dx_body: float,
+        original_dy_body: float,
+        original_dyaw: float,
+        dx_body: float,
+        dy_body: float,
+        dyaw: float,
+    ) -> None:
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self.last_slip_guard_log_ns < int(1.0e9):
+            return
+        self.last_slip_guard_log_ns = now_ns
+        self.get_logger().warn(
+            "Wheel slip guard active: front blocked "
+            f"(min_depth={self.front_block_min_depth:.2f}m, "
+            f"ratio={self.front_block_ratio:.2f}); "
+            f"delta body ({original_dx_body:.3f}, {original_dy_body:.3f}, "
+            f"{original_dyaw:.3f}rad) -> "
+            f"({dx_body:.3f}, {dy_body:.3f}, {dyaw:.3f}rad)"
+        )
 
     # ------------------------------------------------------------------
     # Measurement update
